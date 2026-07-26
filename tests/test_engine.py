@@ -1,7 +1,7 @@
 import unittest
 import numpy as np
 from engine.core import (
-    MultiModalModel, FunctionalTerm, internal_simulator, r2_verisimilitude,
+    MultiModalModel, FunctionalTerm, MultivariateFunctionalTerm, internal_simulator, r2_verisimilitude,
     coverage_verisimilitude, max_error_ratio, compute_aic, compute_bic,
     get_complexity_penalty, hybrid_verisimilitude, classify_model,
     compute_crps, check_bayesian_coverage, check_pit_calibration
@@ -11,7 +11,7 @@ from engine.active_sampling import active_sampling_query
 from engine.sandbox import EvolutionarySandbox, mutate_model, estimate_prob_better
 from engine.substrate import (
     IngestionPlane, RoutingPolicy, ExecutionPlane, AuditPlane, KnowledgePlane,
-    MetaLoopSubstrate, OracleProvider, ConformalCalibrator
+    MetaLoopSubstrate, OracleProvider, ConformalCalibrator, KaggleDataSource
 )
 from engine.pilot import EnzymeKineticsPilot, enzyme_ground_truth, query_enzyme_data
 
@@ -245,6 +245,27 @@ class TestSubstrateAndMetaLoop(unittest.TestCase):
             rng, np.array([1, 2]), np.array([3, 4]), lambda r, s: (np.array([1, 2]), np.array([3, 4]))
         )
         self.assertEqual(hist[0].get("note"), "cooldown active (skip re-evaluation)")
+
+    def test_multivariate_functional_term(self):
+        term = MultivariateFunctionalTerm([[0, "power", 2.0], [1, "log", 1.0]])
+        X = np.array([[2.0, 1.0], [3.0, 2.0]])
+        expected = np.array([4.0 * np.log(2.0), 9.0 * np.log(3.0)])
+        np.testing.assert_allclose(term.evaluate(X), expected, rtol=1e-5)
+
+    def test_multivariate_mutation(self):
+        rng = np.random.default_rng(42)
+        initial_model = MultiModalModel([
+            MultivariateFunctionalTerm([[0, "power", 1.0]])
+        ])
+        mutated = mutate_model(initial_model, rng, num_features=8)
+        self.assertIsNotNone(mutated)
+        self.assertGreater(len(mutated.terms), 0)
+
+    def test_kaggle_data_source(self):
+        ds = KaggleDataSource("data/concrete_data.csv", "concrete_compressive_strength", ["cement", "water"])
+        X, y = ds.load_data()
+        self.assertEqual(X.shape[1], 2)
+        self.assertEqual(len(y), len(X))
 
 
 if __name__ == "__main__":

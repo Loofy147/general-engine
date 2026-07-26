@@ -5,6 +5,43 @@ from engine.core import MultiModalModel, hybrid_verisimilitude, r2_verisimilitud
 from engine.sandbox import EvolutionarySandbox, mutate_model
 from engine.curiosity import CuriosityController
 
+from abc import ABC, abstractmethod
+import pandas as pd
+
+class DataSource(ABC):
+    """
+    Abstract interface for physical or simulated data sources.
+    """
+    @abstractmethod
+    def load_data(self) -> tuple[np.ndarray, np.ndarray]:
+        """
+        Loads the dataset and returns features X and targets y.
+        """
+        pass
+
+class KaggleDataSource(DataSource):
+    """
+    DataSource adapter for Kaggle CSV files.
+    """
+    def __init__(self, filepath: str, target_col: str, feature_cols: list[str] = None):
+        self.filepath = filepath
+        self.target_col = target_col
+        self.feature_cols = feature_cols
+
+    def load_data(self) -> tuple[np.ndarray, np.ndarray]:
+        df = pd.read_csv(self.filepath)
+        df.columns = [c.strip() for c in df.columns]
+        target = self.target_col.strip()
+        if target not in df.columns:
+            raise ValueError(f"Target column '{target}' not found. Available: {list(df.columns)}")
+        y = df[target].to_numpy()
+        if self.feature_cols:
+            features = [f.strip() for f in self.feature_cols]
+            X = df[features].to_numpy()
+        else:
+            X = df.drop(columns=[target]).to_numpy()
+        return X, y
+
 # ================================================================
 # Canonical Event Schema and Ingestion Plane
 # ================================================================

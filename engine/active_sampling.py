@@ -10,10 +10,16 @@ def active_sampling_query(model, rng, candidate_points, n_samples=1):
     selected = []
 
     # Calculate the exclusion radius dynamically based on candidate space range
-    if len(remaining) > 1:
-        min_dist = (np.max(remaining) - np.min(remaining)) * 0.10
+    if remaining.ndim > 1:
+        pt_min = np.min(remaining, axis=0)
+        pt_max = np.max(remaining, axis=0)
+        span = np.max(pt_max - pt_min)
+        min_dist = span * 0.10 if span > 0 else 0.5
     else:
-        min_dist = 0.5
+        if len(remaining) > 1:
+            min_dist = (np.max(remaining) - np.min(remaining)) * 0.10
+        else:
+            min_dist = 0.5
 
     # Retrieve bootstrap samples from model
     if getattr(model, 'k_bootstrap', None) is not None:
@@ -45,7 +51,11 @@ def active_sampling_query(model, rng, candidate_points, n_samples=1):
         selected.append(chosen_val)
 
         # Space-filling: remove points within the exclusion radius
-        mask = np.abs(remaining - chosen_val) >= min_dist
+        if remaining.ndim > 1:
+            dists = np.linalg.norm(remaining - chosen_val, axis=1)
+            mask = dists >= min_dist
+        else:
+            mask = np.abs(remaining - chosen_val) >= min_dist
         remaining = remaining[mask]
 
     return np.array(selected)
