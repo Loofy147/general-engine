@@ -29,7 +29,10 @@ class KaggleDataSource(DataSource):
         self.feature_cols = feature_cols
 
     def load_data(self) -> tuple[np.ndarray, np.ndarray]:
-        df = pd.read_csv(self.filepath)
+        if self.filepath.endswith(".xlsx") or self.filepath.endswith(".xls"):
+            df = pd.read_excel(self.filepath)
+        else:
+            df = pd.read_csv(self.filepath)
         df.columns = [c.strip() for c in df.columns]
         target = self.target_col.strip()
         if target not in df.columns:
