@@ -1,34 +1,76 @@
 import numpy as np
 from engine.core import (
-    MultiModalModel, FunctionalTerm, internal_simulator,
-    classify_model, get_complexity_penalty, compute_crps
+    MultiModalModel, FunctionalTerm, MultivariateFunctionalTerm,
+    internal_simulator, classify_model, get_complexity_penalty, compute_crps
 )
 
-def mutate_model(model, rng, p_step=0.3):
+def mutate_model(model, rng, p_step=0.3, num_features=1):
     """
-    Randomly add, remove, or mutate a term (power, exp, log) in the model.
+    Randomly add, remove, or mutate a term (power, exp, log) in the model,
+    with full support for both univariate and multivariate terms.
     """
     new_terms = [t.copy() for t in model.terms]
 
-    # 20% chance to add a term (if we have less than 3 terms)
-    if rng.random() < 0.2 and len(new_terms) < 3:
+    # Helper to generate a random spec
+    def random_spec():
+        feat_idx = int(rng.integers(0, num_features)) if num_features > 1 else 0
         t_type = rng.choice(["power", "exp", "log"])
-        p_val = rng.uniform(0.1, 5.0)
-        new_terms.append(FunctionalTerm(t_type, p_val))
-    # 10% chance to remove a term (if we have more than 1 term)
+        p_val = float(rng.uniform(0.1, 5.0))
+        return [feat_idx, t_type, p_val]
+
+    # Helper to generate a random term
+    def random_term():
+        if num_features > 1:
+            # 70% chance of a multivariate term, 30% univariate (on a random feature)
+            if rng.random() < 0.7:
+                return MultivariateFunctionalTerm([random_spec()])
+            else:
+                feat_idx = int(rng.integers(0, num_features))
+                t_type = rng.choice(["power", "exp", "log"])
+                p_val = float(rng.uniform(0.1, 5.0))
+                return MultivariateFunctionalTerm([[feat_idx, t_type, p_val]])
+        else:
+            t_type = rng.choice(["power", "exp", "log"])
+            p_val = float(rng.uniform(0.1, 5.0))
+            return FunctionalTerm(t_type, p_val)
+
+    # 1. Add a term
+    if rng.random() < 0.2 and len(new_terms) < 4:
+        new_terms.append(random_term())
+    # 2. Remove a term
     elif rng.random() < 0.1 and len(new_terms) > 1:
         idx = rng.integers(0, len(new_terms))
         new_terms.pop(idx)
-    # Otherwise mutate an existing term
+    # 3. Mutate an existing term
     else:
         idx = rng.integers(0, len(new_terms))
         term = new_terms[idx]
-        # 80% chance to mutate parameter, 20% to change term type
-        if rng.random() < 0.8:
-            term.p = float(np.clip(term.p + rng.normal(0, p_step), 0.1, 5.0))
+
+        if isinstance(term, MultivariateFunctionalTerm):
+            r = rng.random()
+            if r < 0.15 and len(term.specs) < 3:
+                term.specs.append(random_spec())
+            elif r < 0.25 and len(term.specs) > 1:
+                spec_idx = rng.integers(0, len(term.specs))
+                term.specs.pop(spec_idx)
+            else:
+                spec_idx = rng.integers(0, len(term.specs))
+                spec = term.specs[spec_idx]
+                r_spec = rng.random()
+                if r_spec < 0.6:
+                    spec[2] = float(np.clip(spec[2] + rng.normal(0, p_step), 0.1, 5.0))
+                elif r_spec < 0.8:
+                    spec[1] = rng.choice(["power", "exp", "log"])
+                    spec[2] = float(rng.uniform(0.1, 5.0))
+                else:
+                    if num_features > 1:
+                        spec[0] = int(rng.integers(0, num_features))
         else:
-            term.term_type = rng.choice(["power", "exp", "log"])
-            term.p = float(rng.uniform(0.1, 5.0))
+            if rng.random() < 0.8:
+                term.p = float(np.clip(term.p + rng.normal(0, p_step), 0.1, 5.0))
+            else:
+                term.term_type = rng.choice(["power", "exp", "log"])
+                term.p = float(rng.uniform(0.1, 5.0))
 
     return MultiModalModel(new_terms)
 
@@ -85,6 +127,9 @@ class EvolutionarySandbox:
         """
         Runs the evolutionary search with adaptive (1+1)-ES mutation rule and restarts.
         """
+        calib_x_arr = np.atleast_1d(calib_x)
+        num_features = calib_x_arr.shape[1] if calib_x_arr.ndim > 1 else 1
+
         best_model = initial_model
         best_model.fit(calib_x, calib_y, rng=rng)
 
@@ -120,7 +165,7 @@ class EvolutionarySandbox:
             ref_x, ref_y = data_generator_fn(rng, 30)
 
             # Propose and fit mutation
-            candidate = mutate_model(best_model, rng, p_step=sigma)
+            candidate = mutate_model(best_model, rng, p_step=sigma, num_features=num_features)
             candidate.fit(calib_x, calib_y, rng=rng)
 
             # Bootstrap comparison
@@ -163,8 +208,13 @@ class EvolutionarySandbox:
             # Restart mechanism if search stagnates
             if stagnation_counter >= self.restart_stagnation:
                 # Reinitialize to a random power term
-                random_exponent = rng.uniform(0.1, 5.0)
-                best_model = MultiModalModel([FunctionalTerm("power", random_exponent)])
+                if num_features > 1:
+                    feat_idx = int(rng.integers(0, num_features))
+                    random_exponent = rng.uniform(0.1, 5.0)
+                    best_model = MultiModalModel([MultivariateFunctionalTerm([[feat_idx, "power", random_exponent]])])
+                else:
+                    random_exponent = rng.uniform(0.1, 5.0)
+                    best_model = MultiModalModel([FunctionalTerm("power", random_exponent)])
                 best_model.fit(calib_x, calib_y, rng=rng)
                 y_sim = internal_simulator(rng, best_model, ref_x)
                 crps_val = compute_crps(y_sim, ref_y)

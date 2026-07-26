@@ -8,12 +8,16 @@ class FunctionalTerm:
 
     def evaluate(self, x):
         x = np.atleast_1d(x)
+        if x.ndim > 1:
+            x_col = x[:, 0]
+        else:
+            x_col = x
         if self.term_type == "power":
-            return np.power(np.abs(x), self.p)
+            return np.power(np.abs(x_col), self.p)
         elif self.term_type == "exp":
-            return np.exp(-self.p * np.abs(x))
+            return np.exp(-self.p * np.abs(x_col))
         elif self.term_type == "log":
-            return np.log(1.0 + self.p * np.abs(x))
+            return np.log(1.0 + self.p * np.abs(x_col))
         else:
             raise ValueError(f"Unknown term type: {self.term_type}")
 
@@ -22,6 +26,66 @@ class FunctionalTerm:
 
     def __repr__(self):
         return f"{self.term_type}({self.p:.2f})"
+
+
+class MultivariateFunctionalTerm:
+    def __init__(self, specs):
+        """
+        specs: list of lists or tuples, where each element is: [feature_idx, term_type, p]
+        e.g., [[0, "power", 1.0], [1, "power", 2.0]]
+        """
+        self.specs = [list(spec) for spec in specs]
+
+    def evaluate(self, X):
+        X = np.atleast_1d(X)
+        if X.ndim == 1:
+            X = X[:, None]
+        N, D = X.shape
+        result = np.ones(N)
+        for feature_idx, term_type, p in self.specs:
+            idx = int(feature_idx) % D
+            x_col = X[:, idx]
+            if term_type == "power":
+                val = np.power(np.abs(x_col), p)
+            elif term_type == "exp":
+                val = np.exp(-p * np.abs(x_col))
+            elif term_type == "log":
+                val = np.log(1.0 + p * np.abs(x_col))
+            else:
+                raise ValueError(f"Unknown term type: {term_type}")
+            result *= val
+        return result
+
+    @property
+    def p(self):
+        if self.specs:
+            return float(self.specs[0][2])
+        return 1.0
+
+    @p.setter
+    def p(self, value):
+        if self.specs:
+            self.specs[0][2] = float(value)
+
+    @property
+    def term_type(self):
+        if self.specs:
+            return self.specs[0][1]
+        return "power"
+
+    @term_type.setter
+    def term_type(self, value):
+        if self.specs:
+            self.specs[0][1] = str(value)
+
+    def copy(self):
+        return MultivariateFunctionalTerm([list(spec) for spec in self.specs])
+
+    def __repr__(self):
+        parts = []
+        for feature_idx, term_type, p in self.specs:
+            parts.append(f"x{feature_idx}^{term_type}({p:.2f})")
+        return " * ".join(parts) if parts else "1.0"
 
 
 class MultiModalModel:
@@ -34,6 +98,8 @@ class MultiModalModel:
             for item in terms_or_exponents:
                 if isinstance(item, FunctionalTerm):
                     self.terms.append(item.copy())
+                elif isinstance(item, MultivariateFunctionalTerm):
+                    self.terms.append(item.copy())
                 elif isinstance(item, (int, float, np.floating, np.integer)):
                     self.terms.append(FunctionalTerm("power", item))
                 elif isinstance(item, tuple) and len(item) == 2:
@@ -42,6 +108,8 @@ class MultiModalModel:
                     raise ValueError(f"Invalid term specifier: {item}")
         else:
             if isinstance(terms_or_exponents, FunctionalTerm):
+                self.terms.append(terms_or_exponents.copy())
+            elif isinstance(terms_or_exponents, MultivariateFunctionalTerm):
                 self.terms.append(terms_or_exponents.copy())
             else:
                 self.terms.append(FunctionalTerm("power", terms_or_exponents))
@@ -132,23 +200,14 @@ class MultiModalModel:
             X_b = X[boot_idx]
             y_b = y[boot_idx]
             try:
-                base_b = TheilSenRegressor(fit_intercept=False, random_state=rng.integers(0, 100000))
-                min_s = max(m + 1, min(5, n))
-                if min_s > n:
-                    min_s = n
-                ransac_b = RANSACRegressor(estimator=base_b, min_samples=min_s, random_state=rng.integers(0, 100000))
-                ransac_b.fit(X_b, y_b)
-                k_b = ransac_b.estimator_.coef_
+                ts_b = TheilSenRegressor(fit_intercept=False, random_state=rng.integers(0, 100000))
+                ts_b.fit(X_b, y_b)
+                k_b = ts_b.coef_
             except Exception:
                 try:
-                    ts_b = TheilSenRegressor(fit_intercept=False, random_state=rng.integers(0, 100000))
-                    ts_b.fit(X_b, y_b)
-                    k_b = ts_b.coef_
+                    k_b, _, _, _ = np.linalg.lstsq(X_b, y_b, rcond=None)
                 except Exception:
-                    try:
-                        k_b, _, _, _ = np.linalg.lstsq(X_b, y_b, rcond=None)
-                    except Exception:
-                        k_b = self.k.copy()
+                    k_b = self.k.copy()
             k_boot_list.append(k_b)
 
         self.k_bootstrap = np.column_stack(k_boot_list)  # Shape (m, B)
