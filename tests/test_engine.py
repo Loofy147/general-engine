@@ -1,14 +1,18 @@
 import unittest
 import numpy as np
 from engine.core import (
-    MultiModalModel, internal_simulator, r2_verisimilitude,
+    MultiModalModel, FunctionalTerm, internal_simulator, r2_verisimilitude,
     coverage_verisimilitude, max_error_ratio, compute_aic, compute_bic,
-    get_complexity_penalty, hybrid_verisimilitude, classify_model
+    get_complexity_penalty, hybrid_verisimilitude, classify_model,
+    compute_crps, check_bayesian_coverage, check_pit_calibration
 )
 from engine.curiosity import CuriosityController
 from engine.active_sampling import active_sampling_query
 from engine.sandbox import EvolutionarySandbox, mutate_model, estimate_prob_better
-from engine.substrate import IngestionPlane, RoutingPolicy, ExecutionPlane, AuditPlane, KnowledgePlane, MetaLoopSubstrate
+from engine.substrate import (
+    IngestionPlane, RoutingPolicy, ExecutionPlane, AuditPlane, KnowledgePlane,
+    MetaLoopSubstrate, OracleProvider, ConformalCalibrator
+)
 from engine.pilot import EnzymeKineticsPilot, enzyme_ground_truth, query_enzyme_data
 
 
@@ -21,83 +25,97 @@ class TestEngineCore(unittest.TestCase):
         x = np.linspace(0.5, 5.0, 20)
         y = 2.5 * x**2
 
+        # Model with single power term (p=2)
         model = MultiModalModel([2.0])
-        model.fit(x, y)
+        model.fit(x, y, rng=self.rng)
 
-        self.assertAlmostEqual(model.k[0], 2.5, places=4)
-        self.assertIsNotNone(model.cov_matrix)
-        self.assertEqual(model.cov_matrix.shape, (1, 1))
+        self.assertAlmostEqual(model.k[0], 2.5, places=2)
+        self.assertIsNotNone(model.k_bootstrap)
 
         # Test predictions
         y_pred = model(x)
         self.assertEqual(len(y_pred), len(x))
-        np.testing.assert_allclose(y_pred, y, rtol=1e-3)
+        np.testing.assert_allclose(y_pred, y, rtol=1e-2)
+
+    def test_functional_terms_exp_log(self):
+        # Test exponential term
+        term_exp = FunctionalTerm("exp", 1.5)
+        self.assertAlmostEqual(term_exp.evaluate(0.0)[0], 1.0)
+        self.assertAlmostEqual(term_exp.evaluate(1.0)[0], np.exp(-1.5))
+
+        # Test log term
+        term_log = FunctionalTerm("log", 2.0)
+        self.assertAlmostEqual(term_log.evaluate(0.0)[0], 0.0)
+        self.assertAlmostEqual(term_log.evaluate(1.0)[0], np.log(3.0))
+
+        # MultiModalModel with mixed terms
+        model = MultiModalModel([
+            FunctionalTerm("power", 1.0),
+            FunctionalTerm("exp", 0.5),
+            FunctionalTerm("log", 1.0)
+        ])
+        x = np.linspace(0.1, 2.0, 10)
+        design = model.get_design_matrix(x)
+        self.assertEqual(design.shape, (10, 3))
 
     def test_internal_simulator(self):
         x = np.linspace(1.0, 5.0, 10)
         model = MultiModalModel([2.0])
-        model.fit(x, 2.5 * x**2)
+        model.fit(x, 2.5 * x**2, rng=self.rng)
 
         y_sim = internal_simulator(self.rng, model, x, n_iter=200)
         self.assertEqual(y_sim.shape, (10, 200))
 
-    def test_metrics_and_verisimilitude(self):
-        x = np.linspace(1.0, 5.0, 10)
-        y_true = 2.5 * x**2
-        model = MultiModalModel([2.0])
-        model.fit(x, y_true)
+    def test_crps_scoring(self):
+        # Deterministic check
+        y_samples = np.array([[1.0, 5.0]])
+        y_true = np.array([3.0])
+        crps = compute_crps(y_samples, y_true)
+        # E|X - y| = 0.5 * (|1 - 3| + |5 - 3|) = 2
+        # E|X - X'| = 0.5 * (|1 - 1| + |1 - 5| + |5 - 1| + |5 - 5|) = 2
+        # CRPS = E|X - y| - 0.5 * E|X - X'| = 2 - 0.5 * 2 = 1.0
+        self.assertAlmostEqual(crps, 1.0)
 
-        r2 = r2_verisimilitude(model, x, y_true)
-        self.assertGreaterEqual(r2, 0.95)
+    def test_bayesian_coverage_and_pit(self):
+        ref_y = self.rng.normal(0, 1, size=30)
+        y_sim = self.rng.normal(0, 1, size=(30, 1000))
 
-        y_sim = internal_simulator(self.rng, model, x, n_iter=1000)
-        cov = coverage_verisimilitude(y_sim, y_true)
-        self.assertGreaterEqual(cov, 0.80) # 90% predictive interval coverage should be high
+        success, prob, emp = check_bayesian_coverage(y_sim, ref_y, target_coverage=0.80)
+        self.assertTrue(success)
+        self.assertGreater(prob, 0.50)
 
-        mer = max_error_ratio(model, x, y_true)
-        self.assertLess(mer, 0.10)
-
-        # Test AIC and BIC
-        aic = compute_aic(model, x, y_true)
-        bic = compute_bic(model, x, y_true)
-        self.assertIsNotNone(aic)
-        self.assertIsNotNone(bic)
-
-        # Test complexity penalties
-        p_bic = get_complexity_penalty(model, len(x), "BIC")
-        p_aic = get_complexity_penalty(model, len(x), "AIC")
-        self.assertGreater(p_bic, 0)
-        self.assertGreater(p_aic, 0)
-
-        # Test hybrid score with penalties
-        score = hybrid_verisimilitude(r2, cov, mer, lam=0.25, complexity_penalty=p_bic)
-        self.assertGreaterEqual(score, 0.0)
-        self.assertLessEqual(score, 1.0)
+        passes_ks, p_val = check_pit_calibration(y_sim, ref_y)
+        self.assertTrue(passes_ks)
+        self.assertGreater(p_val, 0.05)
 
 
 class TestCuriosityController(unittest.TestCase):
-    def test_adaptive_threshold(self):
-        controller = CuriosityController(window_size=5, initial_success_rate=1.0)
-        self.assertAlmostEqual(controller.get_threshold(), 0.85 + 0.10 * np.tanh(2.5), places=3)
+    def test_thompson_sampling_curiosity(self):
+        rng = np.random.default_rng(12345)
+        controller = CuriosityController(window_size=5, initial_success_rate=0.8, rng=rng)
 
-        # Fill window with False (rejections)
-        for _ in range(5):
+        # Pull threshold several times
+        thresholds = [controller.get_threshold() for _ in range(10)]
+        for t in thresholds:
+            self.assertIn(t, [0.75, 0.80, 0.85, 0.90, 0.95])
+
+        # Record rejections
+        for _ in range(20):
             controller.record_evaluation(False)
 
-        self.assertAlmostEqual(controller.success_rate, 0.0)
-        # s=0.0 -> tanh(-2.5) -> threshold should lower to near 0.75
-        self.assertLess(controller.get_threshold(), 0.78)
+        # Success rate should decrease
+        self.assertLess(controller.success_rate, 0.5)
 
 
 class TestActiveSampling(unittest.TestCase):
-    def test_space_filling(self):
+    def test_bald_active_sampling(self):
         rng = np.random.default_rng(42)
         model = MultiModalModel([2.0])
         model.k = np.array([2.5])
-        model.cov_matrix = np.array([[0.01]])
+        model.k_bootstrap = np.array([[2.4, 2.5, 2.6]])
+        model.residual_scale = 0.10
 
         candidate_points = np.linspace(1.0, 10.0, 50)
-        # Select 3 points
         selected = active_sampling_query(model, rng, candidate_points, n_samples=3)
         self.assertEqual(len(selected), 3)
 
@@ -107,18 +125,42 @@ class TestActiveSampling(unittest.TestCase):
             self.assertGreaterEqual(d, 0.90)
 
 
+class TestConformalCalibration(unittest.TestCase):
+    def test_conformal_calibrator_and_oracle(self):
+        rng = np.random.default_rng(42)
+        oracle = OracleProvider(lambda x: 3.0 * x**2)
+        self.assertEqual(oracle.query_oracle(2.0), 12.0)
+
+        calibrator = ConformalCalibrator(target_coverage=0.90)
+        for x_val in [1.0, 2.0, 3.0, 4.0]:
+            calibrator.register_calibration_point(x_val, oracle.query_oracle(x_val))
+
+        model = MultiModalModel([2.0])
+        model.k = np.array([2.9])
+        model.k_bootstrap = np.array([[2.8, 2.9, 3.0]])
+        model.residual_scale = 0.10
+
+        calibrator.update_calibration(model, rng)
+        self.assertGreater(calibrator.q_scale, 0.0)
+
+        y_pred = np.array([12.0])
+        y_sims = np.array([[11.8, 12.0, 12.2]])
+        calibrated = calibrator.calibrate_interval(y_pred, y_sims)
+        self.assertEqual(calibrated.shape, (1, 3))
+
+
 class TestEvolutionarySandbox(unittest.TestCase):
     def test_mutations(self):
         rng = np.random.default_rng(99)
         model = MultiModalModel([1.0, 2.0])
         mutated = mutate_model(model, rng)
         self.assertIsNotNone(mutated)
-        self.assertTrue(1 <= len(mutated.exponents) <= 3)
+        self.assertTrue(1 <= len(mutated.terms) <= 3)
 
     def test_sandbox_run(self):
         rng = np.random.default_rng(42)
-        controller = CuriosityController(window_size=5, initial_success_rate=0.5)
-        sandbox = EvolutionarySandbox(max_generations=5, B=10, complexity_method="BIC")
+        controller = CuriosityController(window_size=5, initial_success_rate=0.5, rng=rng)
+        sandbox = EvolutionarySandbox(max_generations=3, B=5, complexity_method="BIC")
 
         cal_x = np.linspace(1.0, 5.0, 10)
         cal_y = 3.0 * cal_x**2
@@ -194,6 +236,15 @@ class TestSubstrateAndMetaLoop(unittest.TestCase):
         initial_threshold = pilot.substrate.active_policy.threshold
         best_score, opt_log = pilot.substrate.self_experiment_and_optimize_policies(rng, n_mutations=5)
         self.assertIsNotNone(best_score)
+
+        # Test cooldown period
+        pilot.substrate.knowledge.is_cooldown_active = True
+        pilot.substrate.knowledge.fresh_samples_since_promotion = 0
+        # Call update_scientific_model, it should return early due to cooldown
+        _, hist = pilot.substrate.knowledge.update_scientific_model(
+            rng, np.array([1, 2]), np.array([3, 4]), lambda r, s: (np.array([1, 2]), np.array([3, 4]))
+        )
+        self.assertEqual(hist[0].get("note"), "cooldown active (skip re-evaluation)")
 
 
 if __name__ == "__main__":

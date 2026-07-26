@@ -1,7 +1,7 @@
 import numpy as np
 import uuid
 import time
-from engine.core import MultiModalModel, hybrid_verisimilitude, r2_verisimilitude, coverage_verisimilitude, max_error_ratio
+from engine.core import MultiModalModel, hybrid_verisimilitude, r2_verisimilitude, coverage_verisimilitude, max_error_ratio, internal_simulator
 from engine.sandbox import EvolutionarySandbox, mutate_model
 from engine.curiosity import CuriosityController
 
@@ -252,13 +252,40 @@ class KnowledgePlane:
         # Store policies and A/B test results
         self.policy_score_history = {}
 
+        # Cooldown parameters
+        self.is_cooldown_active = False
+        self.fresh_samples_since_promotion = 0
+
     def update_scientific_model(self, rng, calib_x, calib_y, data_generator_fn):
         """
         Evolve our structural scientific model using the Evolutionary Sandbox.
+        If cooldown is active, skip demotion / status re-evaluation.
         """
+        if self.is_cooldown_active:
+            if self.fresh_samples_since_promotion >= 3:
+                # Fresh dataset has been collected, clear the cooldown
+                self.is_cooldown_active = False
+                self.fresh_samples_since_promotion = 0
+            else:
+                # Bypass search / demotion during cooldown
+                return self.model, [{
+                    "generation": 0,
+                    "model_exponents": self.model.exponents.copy(),
+                    "score": 1.0,
+                    "status": "PROMOTED",
+                    "theta_promote": 0.85,
+                    "note": "cooldown active (skip re-evaluation)"
+                }]
+
         self.model, history = self.sandbox.run(
             rng, calib_x, calib_y, self.model, self.curiosity_controller, data_generator_fn
         )
+
+        # If the search results in a PROMOTED status, activate the cooldown
+        if history and history[-1]["status"] == "PROMOTED":
+            self.is_cooldown_active = True
+            self.fresh_samples_since_promotion = 0
+
         return self.model, history
 
     def evaluate_policy_performance(self, rng, execution_plane, audit_log, policy: RoutingPolicy) -> float:
@@ -317,6 +344,10 @@ class MetaLoopSubstrate:
         # 2. Execution Plane (uses the Policy Plane's active policy)
         result_event = self.execution.execute(canonical_req, self.active_policy, rng)
 
+        # Track fresh samples collected since promotion for cooldown
+        if self.knowledge.is_cooldown_active:
+            self.knowledge.fresh_samples_since_promotion += 1
+
         # 3. Audit Plane
         self.audit.log_event(result_event)
         return result_event
@@ -356,3 +387,69 @@ class MetaLoopSubstrate:
         self.active_policy = best_policy
         self.policy_plane.set_policy("routing", self.active_policy)
         return best_score, optimization_log
+
+
+# ================================================================
+# Decoupled Oracle Provider and Conformal Calibration
+# ================================================================
+class OracleProvider:
+    def __init__(self, ground_truth_fn):
+        self.ground_truth_fn = ground_truth_fn
+
+    def query_oracle(self, x: float) -> float:
+        """
+        Returns the trusted, high-precision ground truth reference for x.
+        """
+        return float(self.ground_truth_fn(x))
+
+
+class ConformalCalibrator:
+    """
+    Implements Split Conformal Prediction to calibrate the engine's predictive intervals
+    against trusted oracle calibration points.
+    """
+    def __init__(self, target_coverage=0.90):
+        self.target_coverage = target_coverage
+        self.calibration_points = []
+        self.q_scale = 1.0  # Conformal scaling multiplier
+
+    def register_calibration_point(self, x: float, y_true: float):
+        """
+        Register a new ground-truth calibration checkpoint from the oracle.
+        """
+        self.calibration_points.append((x, y_true))
+
+    def update_calibration(self, model, rng):
+        """
+        Computes non-conformity scores on calibration set and updates q_scale.
+        non_conformity s_i = |y_i - y_pred_i| / std_pred_i
+        q_scale is the (1 - alpha)*(1 + 1/n) quantile of s_i.
+        """
+        n = len(self.calibration_points)
+        if n < 3:
+            self.q_scale = 1.0  # Not enough points, keep unscaled
+            return
+
+        xs = np.array([pt[0] for pt in self.calibration_points])
+        ys = np.array([pt[1] for pt in self.calibration_points])
+
+        # Get predictions and simulator standard deviations
+        y_pred = model(xs)
+        y_sims = internal_simulator(rng, model, xs, n_iter=200)
+        y_stds = np.std(y_sims, axis=1)
+        y_stds = np.clip(y_stds, 1e-4, None) # Avoid divide by zero
+
+        # Compute non-conformity scores
+        non_conformity_scores = np.abs(ys - y_pred) / y_stds
+
+        # Quantile index: ceil((n + 1) * target_coverage) / n
+        pct = 100.0 * (self.target_coverage * (n + 1) / n)
+        pct = np.clip(pct, 0.0, 100.0)
+        self.q_scale = float(np.percentile(non_conformity_scores, pct))
+
+    def calibrate_interval(self, y_pred, y_sims):
+        """
+        Applies the conformal scaling factor to the predictive simulations.
+        """
+        errors = y_sims - y_pred[:, None]
+        return y_pred[:, None] + self.q_scale * errors
